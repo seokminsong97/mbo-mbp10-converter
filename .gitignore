@@ -43,6 +43,7 @@
 build/
 Build/
 build-*/
+cmake-build-*/
 
 # CMake generated files
 CMakeFiles/
@@ -54,6 +55,7 @@ compile_commands.json
 
 # Temporary files
 *.tmp
+*.tmp.*
 *.log
 *.bak
 *.swp
@@ -67,3 +69,15 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Local Python environments
+.venv/
+venv/
+
+# Licensed market-data files
+*.dbn
+*.dbn.zst
+*.dbn.zstd
