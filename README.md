@@ -95,10 +95,10 @@ before an output file is created. Run `mbo-mbp10 --help` for explicit override
 options. Existing output is preserved unless `--force` is supplied, and the
 writer uses a temporary file before commit.
 
-For production archives, also verify each downloaded file against the
-provider's manifest SHA-256 before conversion. Framing validation proves that
-the file is structurally complete; the independent manifest hash proves that
-the bytes are the intended download.
+If download authenticity needs to be audited, the provider's manifest SHA-256
+can be verified before conversion. This is optional provenance checking:
+framing validation already ensures that the local DBN/Zstandard file is
+structurally complete.
 
 For historical conversion, request data from `00:00:00 UTC` so the daily MBO
 snapshot is present. An arbitrary intraday slice generally cannot reconstruct
@@ -116,6 +116,11 @@ and `side` are one-character strings, and missing levels retain the exact DBN
 `kUndefPrice` sentinel plus zero size/count. The writer uses bounded 65,536-row
 groups and embeds the converted DBN request-range and symbology metadata under
 the `dbn.metadata` schema key.
+
+Before computing features, mask `kUndefPrice` (`9223372036854775807`) in
+`price`, `bid_px_00` through `bid_px_09`, and `ask_px_00` through `ask_px_09`.
+Keep the raw Parquet unchanged so it remains an exact representation of the
+derived MBP-10 records.
 
 MBO-to-MBP-10 conversion is inherently an aggregation and therefore cannot
 preserve MBO-only information such as individual `order_id` values or every
