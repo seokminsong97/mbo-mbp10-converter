@@ -37,6 +37,7 @@ add_library(
   STATIC
     src/converter.cpp
     src/file_converter.cpp
+    src/input_validator.cpp
 )
 add_library(mbo_mbp10::converter ALIAS mbo_mbp10_converter)
 

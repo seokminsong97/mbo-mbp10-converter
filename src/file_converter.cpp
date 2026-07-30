@@ -14,6 +14,7 @@
 #include "databento/enums.hpp"
 #include "databento/file_stream.hpp"
 #include "databento/record.hpp"
+#include "input_validator.hpp"
 
 namespace mbo_mbp10 {
 namespace {
@@ -141,6 +142,7 @@ ConversionStats ConvertFile(const std::filesystem::path& input_path,
                           parent.string()};
   }
 
+  ValidateDbnInput(input_absolute);
   databento::DbnStore input{input_absolute};
   const databento::Metadata& metadata = input.GetMetadata();
   if (!metadata.schema.has_value() ||
