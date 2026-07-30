@@ -59,7 +59,7 @@ def record_differences(expected: Any, actual: Any) -> Iterator[str]:
         return
 
     for depth, (expected_level, actual_level) in enumerate(
-        zip(expected_levels, actual_levels, strict=True)
+        zip(expected_levels, actual_levels)
     ):
         for field in LEVEL_FIELDS:
             expected_value = getattr(expected_level, field)
