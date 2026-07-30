@@ -12,7 +12,8 @@ namespace {
 
 void PrintUsage(std::ostream& stream) {
   stream
-      << "Usage: mbo-mbp10 [options] INPUT.dbn[.zst] OUTPUT.dbn[.zst]\n"
+      << "Usage: mbo-mbp10 [options] INPUT.dbn[.zst] "
+         "OUTPUT.{dbn,dbn.zst,parquet}\n"
       << "\n"
       << "Options:\n"
       << "  --force                Replace an existing output file\n"
@@ -21,7 +22,9 @@ void PrintUsage(std::ostream& stream) {
       << "  --allow-other-dataset  Disable the GLBX.MDP3 metadata check\n"
       << "  --quiet                Do not print conversion statistics\n"
       << "  --help                  Show this help\n"
-      << "  --version               Show the converter version\n";
+      << "  --version               Show the converter version\n"
+      << "\n"
+      << "Output suffixes: .dbn, .dbn.zst, or .parquet\n";
 }
 
 }  // namespace

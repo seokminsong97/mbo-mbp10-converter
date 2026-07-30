@@ -2,11 +2,17 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <arrow/api.h>
+#include <arrow/io/api.h>
+#include <parquet/arrow/reader.h>
 
 #include "databento/constants.hpp"
 #include "databento/datetime.hpp"
@@ -525,13 +531,16 @@ class TemporaryDirectory {
   std::filesystem::path path_;
 };
 
-void TestDbnFileRoundTrip() {
+void TestFileOutputs() {
   TemporaryDirectory temporary;
   const auto input_path = temporary.Path() / "input.dbn";
   const auto output_path = temporary.Path() / "output.dbn.zst";
   const auto compressed_input_path =
       temporary.Path() / "compressed-input.dbn.zst";
   const auto raw_output_path = temporary.Path() / "raw-output.dbn";
+  const auto parquet_output_path = temporary.Path() / "output.parquet";
+  const auto empty_input_path = temporary.Path() / "empty-input.dbn";
+  const auto empty_parquet_path = temporary.Path() / "empty.parquet";
 
   databento::Metadata metadata{};
   metadata.version = databento::kDbnVersion;
@@ -612,6 +621,145 @@ void TestDbnFileRoundTrip() {
     ++raw_record_count;
   }
   CHECK(raw_record_count == 2);
+
+  mbo_mbp10::FileConversionOptions parquet_options{};
+  parquet_options.parquet.row_group_size = 1;
+  CHECK(mbo_mbp10::ConvertFile(input_path, parquet_output_path,
+                               parquet_options)
+            .output_records == 2);
+  CHECK(std::filesystem::is_regular_file(parquet_output_path));
+
+  auto parquet_input =
+      arrow::io::ReadableFile::Open(parquet_output_path.string()).ValueOrDie();
+  auto parquet_reader =
+      parquet::arrow::OpenFile(parquet_input, arrow::default_memory_pool())
+          .ValueOrDie();
+  CHECK(parquet_reader->num_row_groups() == 2);
+  std::shared_ptr<arrow::Table> parquet_table;
+  CHECK(parquet_reader->ReadTable(&parquet_table).ok());
+  parquet_table =
+      parquet_table->CombineChunks(arrow::default_memory_pool()).ValueOrDie();
+
+  CHECK(parquet_table->num_rows() == 2);
+  CHECK(parquet_table->num_columns() == 73);
+  CHECK(parquet_table->schema()->field(0)->name() == "ts_recv");
+  CHECK(parquet_table->schema()->field(0)->type()->Equals(
+      arrow::timestamp(arrow::TimeUnit::NANO, "UTC")));
+  CHECK(parquet_table->schema()->field(8)->name() == "price");
+  CHECK(parquet_table->schema()->field(8)->type()->Equals(arrow::int64()));
+  CHECK(parquet_table->schema()->field(13)->name() == "bid_px_00");
+  CHECK(parquet_table->schema()->field(72)->name() == "ask_ct_09");
+
+  const auto parquet_metadata = parquet_table->schema()->metadata();
+  CHECK(parquet_metadata != nullptr);
+  CHECK(parquet_metadata->Get("dbn.dataset").ValueOrDie() ==
+        databento::dataset::kGlbxMdp3);
+  CHECK(parquet_metadata->Get("dbn.schema").ValueOrDie() == "mbp-10");
+  CHECK(parquet_metadata->Get("mbo_mbp10.price_encoding").ValueOrDie() ==
+        "fixed");
+  CHECK(parquet_metadata->Get("dbn.metadata")
+            .ValueOrDie()
+            .find("\"symbols\":[\"TEST\"]") != std::string::npos);
+
+  const auto column = [&](const std::string& name) {
+    const auto result = parquet_table->GetColumnByName(name);
+    CHECK(result != nullptr);
+    CHECK(result->num_chunks() == 1);
+    return result->chunk(0);
+  };
+  const auto int64_value = [&](const std::string& name) {
+    return std::static_pointer_cast<arrow::Int64Array>(column(name))->Value(1);
+  };
+  const auto uint32_value = [&](const std::string& name) {
+    return std::static_pointer_cast<arrow::UInt32Array>(column(name))->Value(1);
+  };
+  const auto uint8_value = [&](const std::string& name) {
+    return std::static_pointer_cast<arrow::UInt8Array>(column(name))->Value(1);
+  };
+  const auto string_value = [&](const std::string& name) {
+    return std::static_pointer_cast<arrow::StringArray>(column(name))
+        ->GetString(1);
+  };
+
+  CHECK(std::static_pointer_cast<arrow::TimestampArray>(column("ts_recv"))
+            ->Value(1) == 12);
+  CHECK(std::static_pointer_cast<arrow::TimestampArray>(column("ts_event"))
+            ->Value(1) == 2);
+  CHECK(uint8_value("rtype") ==
+        static_cast<std::uint8_t>(databento::RType::Mbp10));
+  CHECK(std::static_pointer_cast<arrow::UInt16Array>(column("publisher_id"))
+            ->Value(1) == 1);
+  CHECK(uint32_value("instrument_id") == 1);
+  CHECK(string_value("action") == "A");
+  CHECK(string_value("side") == "N");
+  CHECK(uint8_value("depth") == 0);
+  CHECK(int64_value("price") == 110);
+  CHECK(uint32_value("size") == 3);
+  CHECK(uint8_value("flags") == databento::FlagSet::kLast);
+  CHECK(std::static_pointer_cast<arrow::Int32Array>(column("ts_in_delta"))
+            ->Value(1) == 1);
+  CHECK(uint32_value("sequence") == 2);
+
+  for (std::size_t level = 0; level < 10; ++level) {
+    std::ostringstream suffix;
+    suffix << '_' << std::setw(2) << std::setfill('0') << level;
+    if (level == 0) {
+      CHECK(int64_value("bid_px" + suffix.str()) == 100);
+      CHECK(int64_value("ask_px" + suffix.str()) == 110);
+      CHECK(uint32_value("bid_sz" + suffix.str()) == 2);
+      CHECK(uint32_value("ask_sz" + suffix.str()) == 3);
+      CHECK(uint32_value("bid_ct" + suffix.str()) == 1);
+      CHECK(uint32_value("ask_ct" + suffix.str()) == 1);
+    } else {
+      CHECK(int64_value("bid_px" + suffix.str()) ==
+            databento::kUndefPrice);
+      CHECK(int64_value("ask_px" + suffix.str()) ==
+            databento::kUndefPrice);
+      CHECK(uint32_value("bid_sz" + suffix.str()) == 0);
+      CHECK(uint32_value("ask_sz" + suffix.str()) == 0);
+      CHECK(uint32_value("bid_ct" + suffix.str()) == 0);
+      CHECK(uint32_value("ask_ct" + suffix.str()) == 0);
+    }
+  }
+
+  ExpectConversionError(
+      [&] {
+        mbo_mbp10::ConvertFile(input_path,
+                               temporary.Path() / "unsupported.csv");
+      },
+      ".dbn, .dbn.zst, or .parquet");
+
+  mbo_mbp10::FileConversionOptions invalid_parquet_options{};
+  invalid_parquet_options.parquet.row_group_size = 0;
+  ExpectConversionError(
+      [&] {
+        mbo_mbp10::ConvertFile(
+            input_path, temporary.Path() / "invalid.parquet",
+            invalid_parquet_options);
+      },
+      "row group size must be positive");
+
+  {
+    constexpr auto kEmptySnapshotFlags = static_cast<std::uint8_t>(
+        databento::FlagSet::kSnapshot | databento::FlagSet::kBadTsRecv |
+        databento::FlagSet::kLast);
+    databento::OutFileStream file{empty_input_path};
+    databento::DbnEncoder encoder{metadata, &file};
+    encoder.EncodeRecord(Clear(kEmptySnapshotFlags));
+  }
+  const auto empty_stats =
+      mbo_mbp10::ConvertFile(empty_input_path, empty_parquet_path);
+  CHECK(empty_stats.input_records == 1);
+  CHECK(empty_stats.output_records == 0);
+  auto empty_input =
+      arrow::io::ReadableFile::Open(empty_parquet_path.string()).ValueOrDie();
+  auto empty_reader =
+      parquet::arrow::OpenFile(empty_input, arrow::default_memory_pool())
+          .ValueOrDie();
+  std::shared_ptr<arrow::Table> empty_table;
+  CHECK(empty_reader->ReadTable(&empty_table).ok());
+  CHECK(empty_table->num_rows() == 0);
+  CHECK(empty_table->num_columns() == 73);
 }
 
 }  // namespace
@@ -632,7 +780,7 @@ int main() {
       {"modify as add", TestModifyAsAdd},
       {"historical snapshot collapse", TestHistoricalSnapshotCollapse},
       {"empty snapshot suppression", TestEmptyHistoricalSnapshotIsSuppressed},
-      {"DBN file round trip", TestDbnFileRoundTrip},
+      {"DBN and Parquet file output", TestFileOutputs},
   };
 
   std::size_t failures = 0;

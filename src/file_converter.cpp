@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <string>
 #include <system_error>
+#include <utility>
 
 #include "databento/constants.hpp"
 #include "databento/dbn.hpp"
@@ -25,19 +26,21 @@ bool EndsWith(const std::string& value, const std::string& suffix) {
              0;
 }
 
-enum class OutputCompression { None, Zstd };
+enum class OutputFormat { Dbn, DbnZstd, Parquet };
 
-OutputCompression ParseOutputCompression(
-    const std::filesystem::path& output_path) {
+OutputFormat ParseOutputFormat(const std::filesystem::path& output_path) {
   const std::string filename = output_path.filename().string();
   if (EndsWith(filename, ".dbn.zst")) {
-    return OutputCompression::Zstd;
+    return OutputFormat::DbnZstd;
   }
   if (EndsWith(filename, ".dbn")) {
-    return OutputCompression::None;
+    return OutputFormat::Dbn;
+  }
+  if (EndsWith(filename, ".parquet")) {
+    return OutputFormat::Parquet;
   }
   throw ConversionError{
-      "output filename must end in .dbn or .dbn.zst"};
+      "output filename must end in .dbn, .dbn.zst, or .parquet"};
 }
 
 std::filesystem::path NormalizedAbsolute(
@@ -95,14 +98,10 @@ databento::Metadata OutputMetadata(const databento::Metadata& input) {
   return output;
 }
 
-ConversionStats EncodeRecords(databento::DbnStore& input,
-                              databento::DbnEncoder& encoder,
-                              const ConverterOptions& options) {
-  Converter converter{
-      [&](const databento::Mbp10Msg& output) {
-        encoder.EncodeRecord(output);
-      },
-      options};
+ConversionStats ConvertRecords(databento::DbnStore& input,
+                               Converter::OutputSink output_sink,
+                               const ConverterOptions& options) {
+  Converter converter{std::move(output_sink), options};
 
   while (const databento::Record* record = input.NextRecord()) {
     const auto* mbo = record->GetIf<databento::MboMsg>();
@@ -120,7 +119,7 @@ ConversionStats EncodeRecords(databento::DbnStore& input,
 ConversionStats ConvertFile(const std::filesystem::path& input_path,
                             const std::filesystem::path& output_path,
                             const FileConversionOptions& options) {
-  const auto compression = ParseOutputCompression(output_path);
+  const auto format = ParseOutputFormat(output_path);
   const auto input_absolute = NormalizedAbsolute(input_path);
   const auto output_absolute = NormalizedAbsolute(output_path);
 
@@ -163,15 +162,33 @@ ConversionStats ConvertFile(const std::filesystem::path& input_path,
   TemporaryOutput temporary{MakeTemporaryPath(output_absolute)};
   ConversionStats stats{};
 
-  if (compression == OutputCompression::Zstd) {
+  if (format == OutputFormat::DbnZstd) {
     databento::OutFileStream file{temporary.Path()};
     databento::detail::ZstdCompressStream compressed{&file};
     databento::DbnEncoder encoder{output_metadata, &compressed};
-    stats = EncodeRecords(input, encoder, options.converter);
-  } else {
+    stats = ConvertRecords(
+        input,
+        [&](const databento::Mbp10Msg& output) {
+          encoder.EncodeRecord(output);
+        },
+        options.converter);
+  } else if (format == OutputFormat::Dbn) {
     databento::OutFileStream file{temporary.Path()};
     databento::DbnEncoder encoder{output_metadata, &file};
-    stats = EncodeRecords(input, encoder, options.converter);
+    stats = ConvertRecords(
+        input,
+        [&](const databento::Mbp10Msg& output) {
+          encoder.EncodeRecord(output);
+        },
+        options.converter);
+  } else {
+    Mbp10ParquetWriter writer{temporary.Path(), output_metadata,
+                              options.parquet};
+    stats = ConvertRecords(
+        input,
+        [&](const databento::Mbp10Msg& output) { writer.Append(output); },
+        options.converter);
+    writer.Close();
   }
 
   std::error_code rename_error;
