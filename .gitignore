@@ -77,7 +77,17 @@ __pycache__/
 .venv/
 venv/
 
-# Licensed market-data files
+# Local credentials (including DATABENTO_API_KEY)
+.env
+.env.*
+!.env.example
+
+# Licensed market-data inputs, reference downloads, and converted outputs
+data/
 *.dbn
-*.dbn.zst
-*.dbn.zstd
+*.dbn.*
+*.parquet
+*.parquet.*
+
+# macOS metadata
+.DS_Store
