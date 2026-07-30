@@ -3,9 +3,10 @@
 ## Goal and scope
 
 Build a deterministic, offline converter from Databento MBO DBN files
-(`.dbn` or `.dbn.zst`) to MBP-10 DBN files.
+(`.dbn` or `.dbn.zst`) to MBP-10 DBN or Parquet files.
 
-- C++ performs streaming decode, book reconstruction, and DBN encoding.
+- C++ performs streaming decode, book reconstruction, and DBN/Parquet
+  encoding.
 - Python compares decoded output with an official MBP-10 download made using
   the same dataset, symbols, and time range.
 - The first correctness target is one week of historical `GLBX.MDP3` data.
@@ -15,13 +16,33 @@ Build a deterministic, offline converter from Databento MBO DBN files
 
 ## Data flow
 
-`DBN reader -> event assembler -> order books -> MBP-10 projector -> DBN writer`
+`DBN reader -> event assembler -> order books -> MBP-10 projector -> DBN or Parquet writer`
 
-The reader validates that the input metadata declares the MBO schema and lets
-the pinned official C++ SDK upgrade supported older DBN versions to DBNv3 in
+The reader first performs a bounded-memory pass over the entire input. For raw
+DBN it validates the prelude, declared metadata extent, and every encoded
+record length. For compressed DBN it additionally validates every concatenated
+Zstandard frame and requires the final frame to complete. This rejects
+truncated metadata or records, corrupt frames, and trailing malformed bytes
+that a permissive streaming decoder could otherwise treat as end-of-file. The
+reader then validates that the metadata declares the MBO schema and lets the
+pinned official C++ SDK upgrade supported older DBN versions to DBNv3 in
 memory. The writer copies request-range and symbology metadata, changes the
 schema to MBP-10, clears the input record limit, and writes through a temporary
 file before rename.
+
+The Parquet branch receives the same `Mbp10Msg` objects as the DBN encoder. It
+flattens every MBP-10 record into 73 non-null columns: 13 scalar fields and six
+price/size/count fields at each of ten depths. Nanosecond timestamps remain
+nanosecond timestamps, all prices remain fixed-point `int64`, and unsigned
+integer widths are retained. Undefined prices remain `kUndefPrice`, not null.
+Zstandard-compressed row groups are bounded at 65,536 records. Converted DBN
+metadata, including request range, symbols, and mapping intervals, is embedded
+as Parquet schema metadata.
+
+MBP-10 is an aggregate projection and cannot retain MBO-only order identity or
+each source order-level mutation. "Lossless Parquet" means lossless with
+respect to the complete derived MBP-10 record stream, not reversible back to
+the source MBO stream.
 
 Book state is isolated by `(publisher_id, instrument_id)`. Each book keeps:
 
@@ -38,16 +59,23 @@ official order-tracking example. Inconsistent IDs, sides, prices, sizes, or
 aggregate overflow fail fast.
 
 Normal book changes are coalesced per `(publisher_id, instrument_id)` event.
-The last change that touched visible depth supplies the output event fields,
-and the completed book at `F_LAST` supplies all ten levels. Transient states
-inside a multi-record event are not published. Every Trade remains a separate
-output record; Fill detail is omitted. If an event has trades and a book
-update, the final book update carries `F_LAST`.
+The final `A`, `C`, or `M` supplies the output price, size, action, and
+timestamps even when that change is below level 10. The shallowest visible
+depth touched supplies `depth`; `side` identifies the side that touched that
+depth, or `N` when both sides did. A Trade after earlier unclosed book changes
+starts a fresh quote-impact group for subsequent changes. The completed book
+at `F_LAST` supplies all ten levels, so transient states are not published.
+Every Trade remains a separate output record and Fill detail is omitted.
 
 Historical MBO snapshots are a clear followed by zero or more adds, all marked
-`F_SNAPSHOT`. They rebuild the full book but produce one `R` MBP-10 snapshot
-at completion, and no record for an empty book. Only the best ten levels on
-each side are projected; absent levels use `kUndefPrice` and zero size/count.
+`F_SNAPSHOT`. They rebuild the full book but produce one MBP-10 snapshot at
+completion, sourced from the final add with `side=N`; an empty book produces no
+record. Only the best ten levels on each side are projected; absent levels use
+`kUndefPrice` and zero size/count.
+
+GLBX can also emit an unflagged, sequence-zero empty `R` reset. It participates
+in the first completed event for that instrument. If no record follows it, it
+is an empty initialization marker and is safely suppressed at EOF.
 
 ## CME normalization compatibility
 
@@ -59,11 +87,12 @@ Databento's `GLBX.MDP3` normalization cutover is scheduled for
 - After the cutover, updates may arrive without `F_LAST`; a separate
   `action=N`, `side=N`, `F_LAST` record closes the event.
 
-The event assembler keeps the last visible book update and pending trades
-independently per book, and treats **any** `F_LAST` record as the boundary. A
-standalone `N/F_LAST` record closes the event but never mutates the book or
-becomes an MBP-10 action. `F_LAST` is moved to the final emitted record when
-the boundary itself has no MBP-10 representation.
+The event assembler keeps the final book-changing update, shallowest affected
+depth/side, and pending trades independently per book, and treats **any**
+`F_LAST` record as the boundary. A standalone `N/F_LAST` record closes the
+event but never mutates the book or becomes an MBP-10 action. A generated quote
+carries `F_LAST`; an invisible book boundary does not promote `F_LAST` onto an
+earlier Trade when no quote is emitted.
 
 This behavior is content-driven. It must not branch on `ts_event`, the requested
 historical date, the filename, or the download date. DBN wire-version handling
@@ -75,11 +104,12 @@ silent repair mode.
 ## Performance model
 
 Records are decoded and encoded as a stream; the full input and output are
-never loaded into memory. Order lookup is average `O(1)`, price-level mutation
-is `O(log L)`, and each MBP-10 projection visits at most ten levels per side.
-Books are sharded by a packed publisher/instrument key. A bounded global output
-queue preserves pending Trade ordering across interleaved instruments without
-unbounded memory growth.
+never loaded into memory. The Parquet writer buffers at most one configured row
+group of completed MBP-10 records. Order lookup is average `O(1)`, price-level
+mutation is `O(log L)`, and each MBP-10 projection visits at most ten levels
+per side. Books are sharded by a packed publisher/instrument key. A bounded
+global output queue preserves pending Trade ordering across interleaved
+instruments without unbounded memory growth.
 
 ## Validation
 
@@ -96,13 +126,18 @@ checksums.
 The Python checker decodes the C++ result and its matching official MBP-10
 oracle, then compares record count, order, headers, event fields, and all ten
 bid/ask price, size, and count levels. DBN container/compression bytes are not
-compared. Focused fixtures cover add, cancel, modify, trade/fill, clear,
-snapshot, top-10 boundary changes, interleaved instruments, legacy inline
-`F_LAST`, and the new standalone `N/F_LAST`.
+compared. The Parquet checker additionally compares all 73 columns with
+fixed-point prices and validates embedded metadata. Focused fixtures cover add,
+cancel, modify, trade/fill, clear, snapshot, top-10 boundary changes,
+interleaved instruments, legacy inline `F_LAST`, the new standalone
+`N/F_LAST`, and native Parquet serialization.
 
 Synthetic tests are necessary but not sufficient. The first validated release
 is accepted only when both normalization fixture sets have zero
 decoded-record mismatches and repeated runs produce identical decoded output.
+Downloaded fixture and production inputs must also match their provider
+manifest sizes and SHA-256 hashes; structural DBN/Zstandard validation is not
+a substitute for source authenticity.
 
 ## References
 
