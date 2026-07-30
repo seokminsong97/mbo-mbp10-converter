@@ -128,7 +128,7 @@ void TestStandaloneLastMarker() {
   converter.Process(Message(databento::Action::Add, databento::Side::Bid, 10,
                             100, 5, 0, 1, 2));
   converter.Process(Message(databento::Action::Add, databento::Side::Ask, 11,
-                            110, 7, 0, 1, 3));
+                            110, 7, 0, 1, 2));
   CHECK(output.size() == 1);
   converter.Process(None(databento::FlagSet::kLast, 1, 4));
   const auto stats = converter.Finish();
@@ -136,7 +136,7 @@ void TestStandaloneLastMarker() {
   CHECK(output.size() == 2);
   CHECK(output[1].flags.IsLast());
   CHECK(output[1].action == databento::Action::Add);
-  CHECK(output[1].side == databento::Side::Ask);
+  CHECK(output[1].side == databento::Side::None);
   CHECK(output[1].levels[0].bid_px == 100);
   CHECK(output[1].levels[0].ask_px == 110);
   CHECK(stats.none_markers == 1);
@@ -153,16 +153,79 @@ void TestLegacyMultiUpdateCoalescing() {
   converter.Process(Message(databento::Action::Add, databento::Side::Bid, 10,
                             100, 5, 0, 1, 2));
   converter.Process(Message(databento::Action::Add, databento::Side::Ask, 11,
-                            110, 7, databento::FlagSet::kLast, 1, 3));
+                            110, 7, databento::FlagSet::kLast, 1, 2));
   const auto stats = converter.Finish();
 
   CHECK(output.size() == 2);
   CHECK(output[1].action == databento::Action::Add);
-  CHECK(output[1].side == databento::Side::Ask);
+  CHECK(output[1].side == databento::Side::None);
   CHECK(output[1].levels[0].bid_px == 100);
   CHECK(output[1].levels[0].ask_px == 110);
   CHECK(output[1].flags.IsLast());
   CHECK(stats.coalesced_book_updates == 1);
+}
+
+void TestEventDepthSideAndSourceNormalization() {
+  std::vector<databento::Mbp10Msg> output;
+  mbo_mbp10::Converter converter{
+      [&](const databento::Mbp10Msg& message) { output.push_back(message); }};
+
+  converter.Process(Clear());
+  converter.Process(Message(databento::Action::Add, databento::Side::Bid, 10,
+                            100, 5, databento::FlagSet::kLast, 1, 2));
+  converter.Process(Message(databento::Action::Add, databento::Side::Ask, 20,
+                            110, 5, databento::FlagSet::kLast, 1, 3));
+  converter.Process(Message(databento::Action::Add, databento::Side::Ask, 21,
+                            120, 5, databento::FlagSet::kLast, 1, 4));
+
+  // The final update supplies the event fields, while depth and side describe
+  // the shallowest affected level across the complete coalesced event.
+  converter.Process(Message(databento::Action::Modify, databento::Side::Bid,
+                            10, 100, 6, 0, 1, 5));
+  converter.Process(Message(databento::Action::Modify, databento::Side::Ask,
+                            21, 120, 6, databento::FlagSet::kLast, 1, 5));
+  CHECK(output.back().action == databento::Action::Modify);
+  CHECK(output.back().price == 120);
+  CHECK(output.back().side == databento::Side::Bid);
+  CHECK(output.back().depth == 0);
+
+  // When both sides touch the shallowest depth, MBP-10 reports side=N.
+  converter.Process(Message(databento::Action::Modify, databento::Side::Bid,
+                            10, 100, 7, 0, 1, 7));
+  converter.Process(Message(databento::Action::Modify, databento::Side::Ask,
+                            20, 110, 7, databento::FlagSet::kLast, 1, 7));
+  CHECK(output.back().side == databento::Side::None);
+  CHECK(output.back().depth == 0);
+
+  // A trade inside a legacy span with delayed F_LAST starts a fresh quote
+  // impact group for the book changes that follow the trade.
+  converter.Process(Message(databento::Action::Modify, databento::Side::Bid,
+                            10, 100, 8, 0, 1, 9));
+  converter.Process(Message(databento::Action::Trade, databento::Side::Ask, 0,
+                            100, 1, 0, 1, 10));
+  converter.Process(Message(databento::Action::Modify, databento::Side::Ask,
+                            20, 110, 8, databento::FlagSet::kLast, 1, 11));
+  CHECK(output.back().side == databento::Side::Ask);
+  CHECK(output.back().depth == 0);
+
+  // An invisible final update supplies action/price/size without changing the
+  // visible depth and side accumulated earlier in the event.
+  for (std::uint32_t index = 0; index < 8; ++index) {
+    converter.Process(Message(
+        databento::Action::Add, databento::Side::Ask, 30 + index,
+        130 + static_cast<std::int64_t>(index) * 10, 1,
+        databento::FlagSet::kLast, 1, 9 + index));
+  }
+  converter.Process(Message(databento::Action::Modify, databento::Side::Bid,
+                            10, 100, 8, 0, 1, 20));
+  converter.Process(Message(databento::Action::Add, databento::Side::Ask, 99,
+                            999, 3, databento::FlagSet::kLast, 1, 21));
+  converter.Finish();
+  CHECK(output.back().action == databento::Action::Add);
+  CHECK(output.back().price == 999);
+  CHECK(output.back().size == 3);
+  CHECK(output.back().side == databento::Side::Bid);
+  CHECK(output.back().depth == 0);
 }
 
 void TestTopTenSuppressionAndCancel() {
@@ -257,6 +320,34 @@ void TestTradeFillAndFinalCancel() {
   CHECK(stats.fills == 1);
 }
 
+void TestTradeWithInvisibleBoundary() {
+  std::vector<databento::Mbp10Msg> output;
+  mbo_mbp10::Converter converter{
+      [&](const databento::Mbp10Msg& message) { output.push_back(message); }};
+
+  converter.Process(Clear());
+  for (std::uint32_t index = 0; index < 11; ++index) {
+    converter.Process(Message(databento::Action::Add, databento::Side::Ask,
+                              1000 + index, 100 + index, 1,
+                              databento::FlagSet::kLast, 1, index + 2));
+  }
+
+  converter.Process(Message(databento::Action::Trade, databento::Side::Bid, 0,
+                            110, 1, 0, 1, 20));
+  converter.Process(Message(databento::Action::Fill, databento::Side::Ask,
+                            1010, 110, 1, 0, 1, 21));
+  converter.Process(Message(databento::Action::Cancel, databento::Side::Ask,
+                            1010, 110, 1, databento::FlagSet::kLast, 1, 22));
+  CHECK(output.back().action == databento::Action::Trade);
+  CHECK(!output.back().flags.IsLast());
+
+  converter.Process(Message(databento::Action::Trade, databento::Side::Ask, 0,
+                            100, 1, databento::FlagSet::kLast, 1, 23));
+  converter.Finish();
+  CHECK(output.back().action == databento::Action::Trade);
+  CHECK(output.back().flags.IsLast());
+}
+
 void TestInterleavedOutputOrder() {
   std::vector<databento::Mbp10Msg> output;
   mbo_mbp10::Converter converter{
@@ -310,6 +401,40 @@ void TestStrictValidation() {
   }
 }
 
+void TestSequenceZeroReset() {
+  constexpr auto kResetFlags = databento::FlagSet::kBadTsRecv;
+  {
+    std::vector<databento::Mbp10Msg> output;
+    mbo_mbp10::Converter converter{
+        [&](const databento::Mbp10Msg& message) { output.push_back(message); }};
+    converter.Process(Clear(kResetFlags, 1, 0));
+    converter.Finish();
+    CHECK(output.empty());
+  }
+  {
+    std::vector<databento::Mbp10Msg> output;
+    mbo_mbp10::Converter converter{
+        [&](const databento::Mbp10Msg& message) { output.push_back(message); }};
+    converter.Process(Clear(kResetFlags, 1, 0));
+    converter.Process(Message(databento::Action::Add, databento::Side::Bid, 1,
+                              100, 2, 0, 1, 1));
+    converter.Process(Message(databento::Action::Add, databento::Side::Ask, 2,
+                              110, 3, databento::FlagSet::kLast, 1, 2));
+    converter.Finish();
+    CHECK(output.size() == 1);
+    CHECK(output[0].action == databento::Action::Add);
+    CHECK(output[0].side == databento::Side::None);
+    CHECK(output[0].levels[0].bid_px == 100);
+    CHECK(output[0].levels[0].ask_px == 110);
+  }
+  {
+    mbo_mbp10::Converter converter{[](const databento::Mbp10Msg&) {}};
+    converter.Process(Clear(kResetFlags, 1, 0));
+    converter.Process(None(0, 1, 1));
+    ExpectConversionError([&] { converter.Finish(); }, "before F_LAST");
+  }
+}
+
 void TestModifyAsAdd() {
   std::vector<databento::Mbp10Msg> output;
   mbo_mbp10::Converter converter{
@@ -347,9 +472,11 @@ void TestHistoricalSnapshotCollapse() {
   const auto stats = converter.Finish();
 
   CHECK(output.size() == 1);
-  CHECK(output[0].action == databento::Action::Clear);
+  CHECK(output[0].action == databento::Action::Add);
   CHECK(output[0].side == databento::Side::None);
-  CHECK(output[0].price == databento::kUndefPrice);
+  CHECK(output[0].price == 99);
+  CHECK(output[0].size == 7);
+  CHECK(output[0].sequence == 20);
   CHECK(output[0].flags.IsSnapshot());
   CHECK(output[0].flags.IsBadTsRecv());
   CHECK(output[0].flags.IsLast());
@@ -428,7 +555,7 @@ void TestDbnFileRoundTrip() {
     encoder.EncodeRecord(Message(databento::Action::Add,
                                  databento::Side::Bid, 1, 100, 2, 0, 1, 2));
     encoder.EncodeRecord(Message(databento::Action::Add,
-                                 databento::Side::Ask, 2, 110, 3, 0, 1, 3));
+                                 databento::Side::Ask, 2, 110, 3, 0, 1, 2));
     encoder.EncodeRecord(None(databento::FlagSet::kLast, 1, 4));
   }
 
@@ -452,7 +579,7 @@ void TestDbnFileRoundTrip() {
   CHECK(output.size() == 2);
   CHECK(output[0].action == databento::Action::Clear);
   CHECK(output[1].action == databento::Action::Add);
-  CHECK(output[1].side == databento::Side::Ask);
+  CHECK(output[1].side == databento::Side::None);
   CHECK(output[1].levels[0].bid_px == 100);
   CHECK(output[1].levels[0].ask_px == 110);
   CHECK(output[1].flags.IsLast());
@@ -473,7 +600,7 @@ void TestDbnFileRoundTrip() {
     encoder.EncodeRecord(Message(databento::Action::Add,
                                  databento::Side::Bid, 1, 100, 2, 0, 1, 2));
     encoder.EncodeRecord(Message(databento::Action::Add,
-                                 databento::Side::Ask, 2, 110, 3, 0, 1, 3));
+                                 databento::Side::Ask, 2, 110, 3, 0, 1, 2));
     encoder.EncodeRecord(None(databento::FlagSet::kLast, 1, 4));
   }
   CHECK(mbo_mbp10::ConvertFile(compressed_input_path, raw_output_path)
@@ -493,12 +620,15 @@ int main() {
   const std::vector<std::pair<std::string, std::function<void()>>> tests{
       {"legacy inline F_LAST", TestLegacyInlineLast},
       {"legacy multi-update coalescing", TestLegacyMultiUpdateCoalescing},
+      {"event field normalization", TestEventDepthSideAndSourceNormalization},
       {"standalone N/F_LAST", TestStandaloneLastMarker},
       {"top-10 suppression", TestTopTenSuppressionAndCancel},
       {"aggregate modify/cancel", TestAggregateModifyAndCancel},
       {"trade/fill/cancel", TestTradeFillAndFinalCancel},
+      {"trade with invisible boundary", TestTradeWithInvisibleBoundary},
       {"interleaved output order", TestInterleavedOutputOrder},
       {"strict validation", TestStrictValidation},
+      {"sequence-zero reset", TestSequenceZeroReset},
       {"modify as add", TestModifyAsAdd},
       {"historical snapshot collapse", TestHistoricalSnapshotCollapse},
       {"empty snapshot suppression", TestEmptyHistoricalSnapshotIsSuppressed},

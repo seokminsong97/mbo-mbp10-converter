@@ -46,6 +46,14 @@ bool IsBookSide(databento::Side side) {
   return side == databento::Side::Bid || side == databento::Side::Ask;
 }
 
+bool IsSequenceZeroReset(const databento::MboMsg& message) {
+  return message.action == databento::Action::Clear &&
+         message.side == databento::Side::None && message.order_id == 0 &&
+         message.price == databento::kUndefPrice && message.size == 0 &&
+         message.sequence == 0 &&
+         message.flags.Raw() == databento::FlagSet::kBadTsRecv;
+}
+
 void ValidateOrderFields(const databento::MboMsg& message,
                          bool allow_zero_size) {
   if (!IsBookSide(message.side)) {
@@ -84,6 +92,9 @@ struct PendingOutput {
 struct BookCandidate {
   databento::MboMsg source{};
   std::uint8_t depth{};
+  bool reset_on_next_visible_update{};
+  bool bid_at_depth{};
+  bool ask_at_depth{};
 };
 
 using BidLevels =
@@ -106,6 +117,7 @@ struct Book {
   bool initialized{};
   bool event_open{};
   bool snapshot_event{};
+  bool sequence_zero_reset_only{};
 };
 
 template <typename Levels>
@@ -322,6 +334,15 @@ class Converter::Impl {
     }
 
     ValidateSnapshotTransition(book, message);
+    const bool sequence_zero_reset = IsSequenceZeroReset(message);
+    if (sequence_zero_reset && book.event_open) {
+      Fail(message, "sequence-zero reset arrived before the previous event completed");
+    }
+    if (sequence_zero_reset) {
+      book.sequence_zero_reset_only = true;
+    } else if (book.sequence_zero_reset_only) {
+      book.sequence_zero_reset_only = false;
+    }
 
     std::optional<std::uint8_t> output_depth;
     bool emit = false;
@@ -385,23 +406,32 @@ class Converter::Impl {
 
     book.event_open = true;
     if (book.snapshot_event) {
+      if (message.action == databento::Action::Add) {
+        book.snapshot_source = message;
+      }
       ProcessSnapshotBoundary(book, message);
       return;
     }
 
     if (emit && message.action == databento::Action::Trade) {
+      if (book.book_candidate.has_value()) {
+        book.book_candidate->reset_on_next_visible_update = true;
+      }
       BufferOutput(book, MakeOutput(message, book, *output_depth), message);
-    } else if (emit) {
-      TrackBookCandidate(book, message, *output_depth);
     } else if (message.action == databento::Action::Add ||
                message.action == databento::Action::Cancel ||
                message.action == databento::Action::Modify) {
-      ++stats_.invisible_book_updates;
+      TrackBookUpdate(book, message, output_depth);
+    } else if (emit) {
+      TrackBookUpdate(book, message, output_depth);
     }
 
     if (message.flags.IsLast()) {
-      BufferCoalescedBookUpdate(book, message);
-      CompleteEvent(book);
+      const bool emitted_book_update =
+          BufferCoalescedBookUpdate(book, message);
+      const bool boundary_is_trade =
+          message.action == databento::Action::Trade;
+      CompleteEvent(book, emitted_book_update || boundary_is_trade);
     }
   }
 
@@ -410,8 +440,18 @@ class Converter::Impl {
       return stats_;
     }
 
-    for (const auto& [key, book] : books_) {
+    for (auto& [key, book] : books_) {
       if (book.event_open) {
+        const bool empty_sequence_zero_reset =
+            book.sequence_zero_reset_only && book.pending.empty() &&
+            book.book_candidate.has_value() &&
+            IsSequenceZeroReset(book.book_candidate->source);
+        if (empty_sequence_zero_reset) {
+          book.book_candidate.reset();
+          book.event_open = false;
+          book.sequence_zero_reset_only = false;
+          continue;
+        }
         std::ostringstream stream;
         stream << "input ended before F_LAST for publisher_id=" << (key >> 32U)
                << ", instrument_id="
@@ -466,32 +506,85 @@ class Converter::Impl {
     }
 
     ++stats_.completed_snapshots;
+    bool emitted_snapshot = false;
     if (!book.bids.empty() || !book.asks.empty()) {
-      BufferOutput(book, MakeOutput(book.snapshot_source, book, 0), message);
+      auto output = MakeOutput(book.snapshot_source, book, 0);
+      output.side = databento::Side::None;
+      BufferOutput(book, std::move(output), message);
       ++stats_.snapshot_outputs;
+      emitted_snapshot = true;
     }
     book.snapshot_event = false;
-    CompleteEvent(book);
+    CompleteEvent(book, emitted_snapshot);
   }
 
-  void TrackBookCandidate(Book& book, const databento::MboMsg& message,
-                          std::uint8_t depth) {
-    if (book.book_candidate.has_value()) {
-      ++stats_.coalesced_book_updates;
+  static void SetAffectedSide(BookCandidate& candidate,
+                              databento::Side side) {
+    if (side == databento::Side::Bid) {
+      candidate.bid_at_depth = true;
+    } else if (side == databento::Side::Ask) {
+      candidate.ask_at_depth = true;
+    } else {
+      candidate.bid_at_depth = true;
+      candidate.ask_at_depth = true;
     }
-    book.book_candidate = BookCandidate{message, depth};
   }
 
-  void BufferCoalescedBookUpdate(Book& book,
+  void TrackBookUpdate(Book& book, const databento::MboMsg& message,
+                       std::optional<std::uint8_t> depth) {
+    if (!depth.has_value()) {
+      ++stats_.invisible_book_updates;
+      if (book.book_candidate.has_value()) {
+        book.book_candidate->source = message;
+      }
+      return;
+    }
+
+    if (!book.book_candidate.has_value()) {
+      book.book_candidate =
+          BookCandidate{message, *depth, false, false, false};
+      SetAffectedSide(*book.book_candidate, message.side);
+      return;
+    }
+
+    ++stats_.coalesced_book_updates;
+    BookCandidate& candidate = *book.book_candidate;
+    candidate.source = message;
+    if (candidate.reset_on_next_visible_update) {
+      candidate.depth = *depth;
+      candidate.reset_on_next_visible_update = false;
+      candidate.bid_at_depth = false;
+      candidate.ask_at_depth = false;
+    }
+    if (*depth < candidate.depth) {
+      candidate.depth = *depth;
+      candidate.bid_at_depth = false;
+      candidate.ask_at_depth = false;
+      SetAffectedSide(candidate, message.side);
+    } else if (*depth == candidate.depth) {
+      SetAffectedSide(candidate, message.side);
+    }
+  }
+
+  static databento::Side AffectedSide(const BookCandidate& candidate) {
+    if (candidate.bid_at_depth == candidate.ask_at_depth) {
+      return databento::Side::None;
+    }
+    return candidate.bid_at_depth ? databento::Side::Bid
+                                  : databento::Side::Ask;
+  }
+
+  bool BufferCoalescedBookUpdate(Book& book,
                                  const databento::MboMsg& boundary) {
     if (!book.book_candidate.has_value()) {
-      return;
+      return false;
     }
     const BookCandidate candidate = *book.book_candidate;
     book.book_candidate.reset();
-    BufferOutput(book,
-                 MakeOutput(candidate.source, book, candidate.depth),
-                 boundary);
+    auto output = MakeOutput(candidate.source, book, candidate.depth);
+    output.side = AffectedSide(candidate);
+    BufferOutput(book, std::move(output), boundary);
+    return true;
   }
 
   void EnsureInitialized(Book& book, const databento::MboMsg& message) {
@@ -600,6 +693,9 @@ class Converter::Impl {
     AddToLevel(book, message.side, message.price, message.size);
     order_it->second = Order{message.price, message.size, message.side};
     const auto new_depth = VisibleDepth(book, message.side, message.price);
+    if (new_depth.has_value() && old_depth.has_value()) {
+      return std::min(*new_depth, *old_depth);
+    }
     return new_depth.has_value() ? new_depth : old_depth;
   }
 
@@ -618,12 +714,14 @@ class Converter::Impl {
                  static_cast<std::uint64_t>(output_queue_.size()));
   }
 
-  void CompleteEvent(Book& book) {
+  void CompleteEvent(Book& book, bool mark_last) {
     if (!book.pending.empty()) {
-      PendingOutput* final = book.pending.back();
-      final->message.flags.SetRaw(
-          static_cast<std::uint8_t>(final->message.flags.Raw() |
-                                    databento::FlagSet::kLast));
+      if (mark_last) {
+        PendingOutput* final = book.pending.back();
+        final->message.flags.SetRaw(
+            static_cast<std::uint8_t>(final->message.flags.Raw() |
+                                      databento::FlagSet::kLast));
+      }
       for (PendingOutput* pending : book.pending) {
         pending->ready = true;
       }
