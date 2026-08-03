@@ -491,6 +491,20 @@ class Converter::Impl {
     if (!message.flags.IsSnapshot()) {
       return;
     }
+    const bool continues_sequence_zero_reset =
+        message.action == databento::Action::Add &&
+        book.sequence_zero_reset_only && book.event_open &&
+        book.pending.empty() && book.book_candidate.has_value() &&
+        IsSequenceZeroReset(book.book_candidate->source) &&
+        book.orders.empty() && book.bids.empty() && book.asks.empty();
+    if (continues_sequence_zero_reset) {
+      book.book_candidate.reset();
+      book.event_open = false;
+      book.sequence_zero_reset_only = false;
+      book.snapshot_event = true;
+      book.snapshot_source = message;
+      return;
+    }
     if (message.action != databento::Action::Clear) {
       Fail(message, "snapshot does not begin with action=R (clear)");
     }

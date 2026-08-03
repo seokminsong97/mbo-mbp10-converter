@@ -441,6 +441,48 @@ void TestSequenceZeroReset() {
   }
 }
 
+void TestWeeklySnapshotAfterSequenceZeroReset() {
+  constexpr auto kResetFlags = databento::FlagSet::kBadTsRecv;
+  constexpr auto kSnapshotFlags = static_cast<std::uint8_t>(
+      databento::FlagSet::kSnapshot | databento::FlagSet::kBadTsRecv);
+  std::vector<databento::Mbp10Msg> output;
+  mbo_mbp10::Converter converter{
+      [&](const databento::Mbp10Msg& message) { output.push_back(message); }};
+
+  converter.Process(Clear(kResetFlags, 1, 0));
+  converter.Process(Message(databento::Action::Add, databento::Side::Bid, 1,
+                            100, 2, kSnapshotFlags, 1, 10));
+  converter.Process(Message(
+      databento::Action::Add, databento::Side::Ask, 2, 110, 3,
+      static_cast<std::uint8_t>(kSnapshotFlags | databento::FlagSet::kLast),
+      1, 11));
+  const auto stats = converter.Finish();
+
+  CHECK(output.size() == 1);
+  CHECK(stats.completed_snapshots == 1);
+  CHECK(stats.snapshot_outputs == 1);
+  CHECK(output[0].action == databento::Action::Add);
+  CHECK(output[0].side == databento::Side::None);
+  CHECK(output[0].flags.IsSnapshot());
+  CHECK(output[0].flags.IsLast());
+  CHECK(output[0].levels[0].bid_px == 100);
+  CHECK(output[0].levels[0].ask_px == 110);
+  CHECK(output[0].levels[0].bid_sz == 2);
+  CHECK(output[0].levels[0].ask_sz == 3);
+
+  mbo_mbp10::Converter strict_converter{
+      [](const databento::Mbp10Msg&) {}};
+  ExpectConversionError(
+      [&] {
+        strict_converter.Process(Message(
+            databento::Action::Add, databento::Side::Bid, 3, 120, 1,
+            static_cast<std::uint8_t>(kSnapshotFlags |
+                                      databento::FlagSet::kLast),
+            1, 12));
+      },
+      "snapshot does not begin with action=R");
+}
+
 void TestModifyAsAdd() {
   std::vector<databento::Mbp10Msg> output;
   mbo_mbp10::Converter converter{
@@ -777,6 +819,8 @@ int main() {
       {"interleaved output order", TestInterleavedOutputOrder},
       {"strict validation", TestStrictValidation},
       {"sequence-zero reset", TestSequenceZeroReset},
+      {"weekly snapshot after sequence-zero reset",
+       TestWeeklySnapshotAfterSequenceZeroReset},
       {"modify as add", TestModifyAsAdd},
       {"historical snapshot collapse", TestHistoricalSnapshotCollapse},
       {"empty snapshot suppression", TestEmptyHistoricalSnapshotIsSuppressed},
